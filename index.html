@@ -3,44 +3,80 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Live2D Web Demo</title>
+  <title>Live2D Camera Tracking Demo</title>
   <style>
     body {
       margin: 0;
       padding: 0;
-      background-color: #f0f0f0;
+      background-color: #1a1a1a;
       display: flex;
       justify-content: center;
       align-items: center;
       height: 100vh;
       overflow: hidden;
+      font-family: sans-serif;
     }
     #canvas {
       width: 100%;
       height: 100%;
     }
+    #loading {
+      position: absolute;
+      color: white;
+      font-size: 18px;
+      background: rgba(0,0,0,0.7);
+      padding: 15px 25px;
+      border-radius: 8px;
+      pointer-events: none;
+    }
+    /* Webカメラの映像（確認用に画面左下に小さく表示） */
+    #webcam {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      width: 160px;
+      height: 120px;
+      border: 2px solid #555;
+      border-radius: 6px;
+      transform: scaleX(-1); /* 鏡像反転 */
+      z-index: 10;
+    }
   </style>
 
-  <!-- PixiJS (描画ライブラリ) -->
+  <!-- 1. PixiJS v6 -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pixi.js/6.5.9/browser/pixi.min.js"></script>
-  
-  <!-- Live2D Cubism Core (公式コアライブラリ) -->
+
+  <!-- 2. Live2D Cubism Core -->
   <script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
-  
-  <!-- pixi-live2d-display (Live2Dを簡単につなぐライブラリ) -->
-  <script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display/dist/index.min.js"></script>
+
+  <!-- 3. pixi-live2d-display -->
+  <script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/index.min.js"></script>
+
+  <!-- 4. MediaPipe Face Landmarker (カメラでの顔認識ライブラリ) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js" crossorigin="anonymous"></script>
 </head>
 <body>
 
-  <!-- Live2Dを表示するキャンバス -->
+  <div id="loading">ライブラリとカメラを準備中...</div>
   <canvas id="canvas"></canvas>
+  <!-- 非表示にしたい場合は style="display:none;" にしてください -->
+  <video id="webcam" autoplay playsinline muted></video>
 
   <script>
-    const { Application, live2d } = PIXI;
-    const { Live2DModel } = live2d;
+    // PixiJSがグローバルに認識されるように設定
+    window.PIXI = PIXI;
 
-    (async function () {
-      // 1. PixiJS アプリケーションの作成
+    const { Application } = PIXI;
+    const { Live2DModel } = PIXI.live2d;
+
+    let model = null;
+    let faceLandmarker = null;
+    let lastVideoTime = -1;
+
+    async function init() {
+      const loadingEl = document.getElementById('loading');
+
+      // --- A. PixiJS のセットアップ ---
       const app = new Application({
         view: document.getElementById('canvas'),
         autoStart: true,
@@ -48,35 +84,113 @@
         transparent: true
       });
 
-      // 2. Live2Dモデルのロード (高品質なサンプルモデル: Mao)
-      // 他のモデルに変更したい場合は、この.model3.jsonのURLを差し替えてください
+      // --- B. Live2D モデルのロード ---
+      // 高品質サンプルモデル（ひより / Maoなど）
       const modelUrl = 'https://cdn.jsdelivr.net/gh/guansss/pixi-live2d-display/test/assets/mao/mao.model3.json';
 
-      const model = await Live2DModel.from(modelUrl);
+      try {
+        model = await Live2DModel.from(modelUrl);
+        app.stage.addChild(model);
 
-      // 3. 画面に追加
-      app.stage.addChild(model);
-
-      // 4. モデルの配置とスケール（サイズ）設定
-      model.anchor.set(0.5, 0.5); // 中央合わせ
-      model.x = window.innerWidth / 2;
-      model.y = window.innerHeight / 2 + 100; // 少し下寄りに配置
-      model.scale.set(0.25); // 拡大・縮小率
-
-      // 5. インタラクション設定（マウス・カーソル追従）
-      // これにより、顔の向きや目線がカーソルを追いかけ、物理演算も自動適用されます
-      model.on('hit', (hitAreas) => {
-        if (hitAreas.includes('Body')) {
-          model.motion('tap_body');
-        }
-      });
-
-      // ウィンドウサイズが変更されたときに位置を調整
-      window.addEventListener('resize', () => {
+        // モデルの初期配置
+        model.anchor.set(0.5, 0.5);
         model.x = window.innerWidth / 2;
-        model.y = window.innerHeight / 2 + 100;
+        model.y = window.innerHeight / 2 + 150;
+        model.scale.set(0.28);
+
+        // ウィンドウリサイズ対応
+        window.addEventListener('resize', () => {
+          model.x = window.innerWidth / 2;
+          model.y = window.innerHeight / 2 + 150;
+        });
+      } catch (err) {
+        console.error('モデルのロードに失敗しました:', err);
+        loadingEl.innerText = 'モデルの読み込みに失敗しました。';
+        return;
+      }
+
+      // --- C. MediaPipe (カメラ認識) のセットアップ ---
+      loadingEl.innerText = 'カメラと顔認識AIを起動中...';
+      const vision = await window.FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+      );
+
+      faceLandmarker = await window.FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+          delegate: 'GPU'
+        },
+        runningMode: 'VIDEO',
+        numFaces: 1
       });
-    })();
+
+      // --- D. Webカメラの有効化 ---
+      const video = document.getElementById('webcam');
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        video.srcObject = stream;
+        video.addEventListener('loadeddata', () => {
+          loadingEl.style.display = 'none'; // 準備完了で非表示
+          predictWebcam(video);
+        });
+      } catch (err) {
+        console.error('カメラのアクセス許可が得られませんでした:', err);
+        loadingEl.innerText = 'カメラへのアクセスを許可してください（またはカメラ非対応環境です）。';
+      }
+    }
+
+    // --- E. カメラ映像から顔の動きを取得しLive2Dに反映するループ処理 ---
+    async function predictWebcam(video) {
+      if (lastVideoTime !== video.currentTime && faceLandmarker) {
+        lastVideoTime = video.currentTime;
+        const results = faceLandmarker.detectForVideo(video, performance.now());
+
+        if (results.faceLandmarks && results.faceLandmarks.length > 0 && model) {
+          const landmarks = results.faceLandmarks[0];
+
+          // 1. 顔の向き（ピッチ・ヨー・ロール）の算出
+          const nose = landmarks[1];      // 鼻先
+          const leftEye = landmarks[33];  // 左目
+          const rightEye = landmarks[263];// 右目
+
+          // 顔の横回転 (Angle X)
+          const yaw = (nose.x - 0.5) * -60; 
+          // 顔の縦回転 (Angle Y)
+          const pitch = (nose.y - 0.5) * -60;
+          // 顔の傾き (Angle Z)
+          const roll = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x) * (180 / Math.PI);
+
+          // 2. 口の開閉度の算出
+          const topLip = landmarks[13];
+          const bottomLip = landmarks[14];
+          const mouthDistance = Math.hypot(topLip.x - bottomLip.x, topLip.y - bottomLip.y);
+          const mouthOpen = Math.min(Math.max((mouthDistance - 0.015) * 15, 0), 1);
+
+          // --- Live2D パラメータへ直接適用 ---
+          const coreModel = model.internalModel.coreModel;
+
+          // 顔の向き (ParamAngleX, Y, Z)
+          coreModel.setParameterValueById('ParamAngleX', yaw);
+          coreModel.setParameterValueById('ParamAngleY', pitch);
+          coreModel.setParameterValueById('ParamAngleZ', roll);
+
+          // 体の連動
+          coreModel.setParameterValueById('ParamBodyAngleX', yaw * 0.5);
+
+          // 口の開閉
+          coreModel.setParameterValueById('ParamMouthOpenY', mouthOpen);
+
+          // 目線
+          coreModel.setParameterValueById('ParamEyeBallX', yaw / 30);
+          coreModel.setParameterValueById('ParamEyeBallY', pitch / 30);
+        }
+      }
+
+      requestAnimationFrame(() => predictWebcam(video));
+    }
+
+    // 開始
+    init();
   </script>
 </body>
 </html>
